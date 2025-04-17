@@ -15,7 +15,7 @@ import os
 import time
 
 # Add development mode flag at the top of the file, after imports
-DEV_MODE = True  # Set to False in production
+DEV_MODE = False  # Set to False in production
 
 # Global variable to store the last refresh time and data
 # This is okay to be global as it's read-only for users
