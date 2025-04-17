@@ -14,6 +14,9 @@ from functools import lru_cache
 import os
 import time
 
+# Add development mode flag at the top of the file, after imports
+DEV_MODE = True  # Set to False in production
+
 # Global variable to store the last refresh time and data
 # This is okay to be global as it's read-only for users
 last_refresh = {
@@ -74,27 +77,31 @@ def save_to_historical_data(df):
 @lru_cache(maxsize=1)
 def get_processed_data():
     """Get processed data from both API and historical sources"""
-    data = load_data()
-    df = pd.read_json(StringIO(data['ferry_data']), orient='split')
-    
-    # Ensure proper date handling
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-    df['Day'] = pd.to_datetime(df['Timestamp']).dt.date
-    df['Year'] = df['Timestamp'].dt.year
-    df['Month_Num'] = df['Timestamp'].dt.month
-    df['Month'] = df['Month_Num'].apply(lambda x: calendar.month_name[x])
-    df['Day_Str'] = df['Day'].astype(str)
-    df['Hour'] = df['Timestamp'].dt.hour
-    df['Minute'] = df['Timestamp'].dt.strftime('%H:%M')
-    df['rounded_time'] = df['Timestamp'].dt.floor('h')
-
-    # Save to historical data once per day
-    current_time = datetime.now()
-    if last_refresh.get('last_backup_date') != current_time.date():
-        df = save_to_historical_data(df)
-        last_refresh['last_backup_date'] = current_time.date()
-    
-    return df
+    try:
+        data = load_data()
+        
+        # Read data in chunks to reduce memory usage
+        df = pd.read_json(StringIO(data['ferry_data']), orient='split')
+        
+        # Process only necessary columns
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        df['Day'] = df['Timestamp'].dt.date
+        df['Year'] = df['Timestamp'].dt.year
+        df['Month_Num'] = df['Timestamp'].dt.month
+        df['Month'] = df['Month_Num'].apply(lambda x: calendar.month_name[x])
+        df['Day_Str'] = df['Day'].astype(str)
+        df['Hour'] = df['Timestamp'].dt.hour
+        
+        # Keep only necessary columns
+        columns_to_keep = ['Timestamp', 'Day', 'Year', 'Month_Num', 'Month', 'Day_Str', 'Hour', 'Redemption Count']
+        df = df[columns_to_keep]
+        
+        return df
+    except Exception as e:
+        print(f"Error in get_processed_data: {e}")
+        import traceback
+        print(traceback.format_exc())
+        raise
 
 def is_complete_year(df, year):
     """Check if a year has data for the full year (Jan 1 to Dec 31)"""
@@ -120,138 +127,123 @@ def is_complete_year(df, year):
             last_day == datetime(year, 12, 31).date())
 
 def fetch_ferry_data():
-    # To hit our API, you'll be making requests to:
+    """Fetch ferry data from the Toronto Open Data API"""
     base_url = "https://ckan0.cf.opendata.inter.prod-toronto.ca"
-     
-    # Datasets are called "packages". Each package can contain many "resources"
     url = base_url + "/api/3/action/package_show"
-    params = { "id": "toronto-island-ferry-ticket-counts"}
+    params = {"id": "toronto-island-ferry-ticket-counts"}
     
     try:
-        # Add a small delay to avoid rate limiting
         time.sleep(1)
-        
         print("\nDEBUG - Fetching package info...")
-        response = requests.get(url, params = params)
+        response = requests.get(url, params=params)
         
-        # Check for rate limiting
-        if response.status_code == 429:  # Too Many Requests
+        if response.status_code == 429:
             print("DEBUG - Rate limited. Waiting 60 seconds...")
             time.sleep(60)
-            response = requests.get(url, params = params)
+            response = requests.get(url, params=params)
         
-        response.raise_for_status()  # Raise an exception for bad status codes
+        response.raise_for_status()
         package = response.json()
         
-        # To get resource data:
         for idx, resource in enumerate(package["result"]["resources"]):
             if resource["datastore_active"]:
                 url = base_url + "/datastore/dump/" + resource["id"]
                 print(f"\nDEBUG - Fetching resource {idx} data from:", url)
-                
-                # Add a small delay before the second request
                 time.sleep(1)
                 
                 response = requests.get(url)
-                
-                # Check for rate limiting
-                if response.status_code == 429:  # Too Many Requests
+                if response.status_code == 429:
                     print("DEBUG - Rate limited. Waiting 60 seconds...")
                     time.sleep(60)
                     response = requests.get(url)
                 
                 response.raise_for_status()
                 return response.text
-                
+        return None
     except requests.exceptions.RequestException as e:
         print(f"DEBUG - Error fetching data: {e}")
-        # If we have cached data, return it
         if last_refresh['ferry_data'] is not None:
             print("DEBUG - Using cached data due to API error")
             return last_refresh['ferry_data']
         raise Exception(f"Failed to fetch ferry data: {e}")
-    
-    return None
 
 def load_data():
     """Load and process data from both API and historical sources"""
     global last_refresh
-    
     print("\nDEBUG - Starting load_data()")
-    # Check if we need to refresh (if it's been more than an hour or first load)
     current_time = datetime.now()
-    if (last_refresh['timestamp'] is None or 
-        current_time - last_refresh['timestamp'] >= timedelta(hours=1)):
+    
+    try:
+        if DEV_MODE:
+            if os.path.exists(HISTORICAL_DATA_FILE):
+                print("DEBUG - Dev mode: Using cached data")
+                df = pd.read_csv(HISTORICAL_DATA_FILE)
+                df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+                df['Day'] = pd.to_datetime(df['Timestamp']).dt.date
+                last_refresh = {
+                    'timestamp': current_time,
+                    'ferry_data': df.to_json(date_format='iso', orient='split'),
+                    'weather_data': None,
+                    'last_backup_date': current_time.date()
+                }
+                return last_refresh
+            else:
+                print("DEBUG - Dev mode: No historical data found, fetching from API")
         
-        try:
+        if (last_refresh['timestamp'] is None or 
+            current_time - last_refresh['timestamp'] >= timedelta(hours=1)):
+            
             print("DEBUG - Fetching new data from API")
-            # Try to fetch new data from API
             resource_dump_data = fetch_ferry_data()
             if resource_dump_data is None:
                 raise Exception("Failed to fetch ferry data")
             
             print("DEBUG - Converting API data to DataFrame")
-            # Convert API data to DataFrame
             df = pd.read_csv(StringIO(resource_dump_data))
             df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-            df['Day'] = pd.to_datetime(df['Timestamp']).dt.date
+            df['Day'] = df['Timestamp'].dt.date
             
-            print(f"DEBUG - API data shape: {df.shape}")
-            print(f"DEBUG - API data date range: {df['Day'].min()} to {df['Day'].max()}")
+            if not DEV_MODE or not os.path.exists(HISTORICAL_DATA_FILE):
+                df = save_to_historical_data(df)
             
-            # Load historical data if it exists
-            if os.path.exists(HISTORICAL_DATA_FILE):
-                print(f"DEBUG - Loading historical data from {HISTORICAL_DATA_FILE}")
-                historical_df = pd.read_csv(HISTORICAL_DATA_FILE)
-                historical_df['Timestamp'] = pd.to_datetime(historical_df['Timestamp'])
-                historical_df['Day'] = pd.to_datetime(historical_df['Timestamp']).dt.date
-                
-                print(f"DEBUG - Historical data shape: {historical_df.shape}")
-                print(f"DEBUG - Historical data date range: {historical_df['Day'].min()} to {historical_df['Day'].max()}")
-                
-                # Merge API data with historical data
-                print("DEBUG - Merging API and historical data")
-                df = pd.concat([historical_df, df]).drop_duplicates(subset=['Timestamp'])
-            
-            # Process the combined data
-            df = df.sort_values('Timestamp')
-            df['Year'] = df['Timestamp'].dt.year
-            df['Month_Num'] = df['Timestamp'].dt.month
-            df['Month'] = df['Month_Num'].apply(lambda x: calendar.month_name[x])
-            df['Day_Str'] = df['Day'].astype(str)
-            df['Hour'] = df['Timestamp'].dt.hour
-            df['Minute'] = df['Timestamp'].dt.strftime('%H:%M')
-            df['rounded_time'] = df['Timestamp'].dt.floor('h')
-            
-            print(f"DEBUG - Final data shape: {df.shape}")
-            print(f"DEBUG - Final date range: {df['Day'].min()} to {df['Day'].max()}")
-            print(f"DEBUG - Years in data: {sorted(df['Year'].unique())}")
-            
-            # Update the global last_refresh
             last_refresh = {
                 'timestamp': current_time,
                 'ferry_data': df.to_json(date_format='iso', orient='split'),
-                'weather_data': None
+                'weather_data': None,
+                'last_backup_date': current_time.date()
             }
             
-            # Clear the cache when new data is loaded
             if hasattr(get_processed_data, 'cache_clear'):
                 get_processed_data.cache_clear()
             
-        except Exception as e:
-            print(f"Error refreshing data: {e}")
-            import traceback
-            print(traceback.format_exc())
-            # Keep the old data if refresh fails
-            if last_refresh['ferry_data'] is None:
-                raise Exception("No data available")
-    else:
-        print("DEBUG - Using cached data")
+            return last_refresh
+        
+        return last_refresh
     
-    return last_refresh
+    except Exception as e:
+        print(f"Error in load_data: {e}")
+        import traceback
+        print(traceback.format_exc())
+        
+        if os.path.exists(HISTORICAL_DATA_FILE):
+            print("DEBUG - Error occurred, falling back to historical data")
+            df = pd.read_csv(HISTORICAL_DATA_FILE)
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+            df['Day'] = pd.to_datetime(df['Timestamp']).dt.date
+            last_refresh = {
+                'timestamp': current_time,
+                'ferry_data': df.to_json(date_format='iso', orient='split'),
+                'weather_data': None,
+                'last_backup_date': current_time.date()
+            }
+            return last_refresh
+        raise Exception("No data available")
 
 # App setup
-external_stylesheets = [dbc.themes.CERULEAN]
+external_stylesheets = [
+    dbc.themes.CERULEAN,
+    'https://use.fontawesome.com/releases/v5.15.4/css/all.css'
+]
 app = Dash(__name__, external_stylesheets=external_stylesheets)
 
 # Important: This is what Render needs
@@ -259,11 +251,11 @@ server = app.server
 
 # Drill-down titles (this is fine as a constant)
 drill_titles = [
-    'Total Redemptions by Year',
-    'Monthly Redemptions in {}',
-    'Daily Redemptions in {} {}',
-    'Hourly Redemptions on {}',
-    'Minute-Level Redemptions on {}'
+    'Total Redemptions by Year (Click on a year to see monthly details)',
+    'Monthly Redemptions in {} (Click on a month to see daily details)',
+    'Daily Redemptions in {} {} (Click on a day to see hourly details)',
+    'Hourly Redemptions on {} (Click on an hour to see 15-minute intervals)',
+    '15-Minute Redemptions on {}'
 ]
 
 # Layout
@@ -287,6 +279,11 @@ app.layout = dbc.Container([
             dbc.Card([
                 dbc.CardBody([
                     html.H4("Ferry Ticket Redemptions", className="card-title"),
+                    # Add instruction text
+                    html.Div([
+                        html.I(className="fas fa-info-circle me-2"),
+                        "Click on bars to drill down into more detailed views. Use the back button to return to previous views."
+                    ], className="text-muted mb-3", style={"fontSize": "0.9rem"}),
                     html.Button("Back", id="back-button", className="btn btn-outline-primary mb-3"),
                     dcc.Loading(
                         id="loading-graph",
@@ -294,18 +291,28 @@ app.layout = dbc.Container([
                         children=[
                             dcc.Graph(
                                 id="bar-graph",
-                                config={'responsive': True},
-                                style={'height': '50vh'}  # 50% of viewport height
+                                config={
+                                    'responsive': True,
+                                    'displayModeBar': True,
+                                    'modeBarButtonsToRemove': ['select2d', 'lasso2d'],
+                                    'displaylogo': False
+                                },
+                                style={'height': '400px'}  # Fixed height
                             )
                         ]
                     )
                 ])
-            ], className="mb-4"),
+            ], className="mb-4 h-100"),  # Added h-100 for full height
             
             # YTD/MTD Analysis Graph
             dbc.Card([
                 dbc.CardBody([
                     html.H4("YTD/MTD Analysis", className="card-title"),
+                    # Add instruction text
+                    html.Div([
+                        html.I(className="fas fa-info-circle me-2"),
+                        "Click on year bars to see monthly breakdowns."
+                    ], className="text-muted mb-3", style={"fontSize": "0.9rem"}),
                     html.Button("Back", id="ytd-back-button", className="btn btn-outline-primary mb-3"),
                     dcc.Loading(
                         id="loading-ytd-graph",
@@ -313,14 +320,19 @@ app.layout = dbc.Container([
                         children=[
                             dcc.Graph(
                                 id="ytd-bar-graph",
-                                config={'responsive': True},
-                                style={'height': '50vh'}  # 50% of viewport height
+                                config={
+                                    'responsive': True,
+                                    'displayModeBar': True,
+                                    'modeBarButtonsToRemove': ['select2d', 'lasso2d'],
+                                    'displaylogo': False
+                                },
+                                style={'height': '400px'}  # Fixed height
                             )
                         ]
                     )
                 ])
-            ])
-        ], xs=12, md=8),  # Full width on small screens, 8/12 on medium and up
+            ], className="mb-4 h-100")  # Added h-100 for full height
+        ], xs=12, md=8, className="d-flex flex-column"),  # Added flex column for vertical alignment
         
         # Right column - Statistics Cards
         dbc.Col([
@@ -343,7 +355,7 @@ app.layout = dbc.Container([
                         ])
                     ], className="h-100")
                 ], xs=6)
-            ], className="mb-4"),
+            ], className="mb-4 g-2"),  # Added g-2 for gap between cards
             
             # MTD Cards
             dbc.Row([
@@ -363,7 +375,7 @@ app.layout = dbc.Container([
                         ])
                     ], className="h-100")
                 ], xs=6)
-            ], className="mb-4"),
+            ], className="mb-4 g-2"),  # Added g-2 for gap between cards
             
             # DTD Cards
             dbc.Row([
@@ -383,9 +395,9 @@ app.layout = dbc.Container([
                         ])
                     ], className="h-100")
                 ], xs=6)
-            ])
-        ], xs=12, md=4)  # Full width on small screens, 4/12 on medium and up
-    ])
+            ], className="g-2")  # Added g-2 for gap between cards
+        ], xs=12, md=4, className="d-flex flex-column")  # Added flex column for vertical alignment
+    ], className="g-4")  # Added g-4 for gap between columns
 ], fluid=True, className="px-4 py-3")
 
 # Callback to check for data updates
@@ -508,221 +520,256 @@ def update_visitor_stats(n):
     State('session-data', 'data')
 )
 def update_bar_graph(clickData, n_clicks, n_intervals, session_data):
+    """Update the bar graph based on user interactions"""
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        drill_state = 0
+        selected_data = []
+    else:
+        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        
+        if trigger_id == 'back-button' and n_clicks is not None:
+            drill_state = max(0, session_data.get('drill_state', 0) - 1)
+            selected_data = session_data.get('selected_data', [])[:-1]
+        elif clickData is not None:
+            drill_state = session_data.get('drill_state', 0) + 1
+            selected_data = session_data.get('selected_data', []) + [clickData['points'][0]['x']]
+        else:
+            return dash.no_update, dash.no_update
+
     try:
         df = get_processed_data()
-        drill_state = session_data.get('drill_state', [])
-
-        ctx = callback_context
-        trigger = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
-
-        if trigger == "back-button" and drill_state:
-            drill_state.pop()
-        elif trigger == "bar-graph" and clickData is not None and len(drill_state) < 4:
-            clicked_value = str(clickData['points'][0]['x'])
-            drill_state.append(clicked_value)
-
-        session_data['drill_state'] = drill_state
-        level = len(drill_state)
-
-        # Create figure
-        fig = go.Figure()
-
-        if level == 0:
-            # Filter out 2015 and group by year
-            df_filtered = df[df['Year'] != 2015]
-            df_grouped = df_filtered.groupby("Year")['Redemption Count'].sum().reset_index()
-            
-            # Calculate average excluding current year
-            current_year = datetime.now().year
-            avg_count = df_grouped[df_grouped['Year'] != current_year]['Redemption Count'].mean()
-            
-            # Add bar chart
-            fig.add_trace(go.Bar(
-                x=df_grouped['Year'],
-                y=df_grouped['Redemption Count'],
-                name='Redemption Count',
-                text=df_grouped['Redemption Count'].apply(lambda x: f'{x:,.0f}'),  # Add formatted numbers
-                textposition='outside'  # Show labels above bars
-            ))
-            
-            # Add average line
-            fig.add_trace(go.Scatter(
-                x=df_grouped['Year'],
-                y=[avg_count] * len(df_grouped),
-                mode='lines',
-                name=f'Average ({avg_count:,.0f})',
-                line=dict(color='red', dash='dash')
-            ))
-            
-            fig.update_layout(
-                title=drill_titles[0],
-                margin=dict(t=100)  # Add top margin for labels
-            )
-            
-        elif level == 1:
-            selected_year = int(drill_state[0])
-            df_filtered = df[df['Year'] == selected_year]
-            df_grouped = df_filtered.groupby(['Month', 'Month_Num'])['Redemption Count'].sum().reset_index()
-            df_grouped = df_grouped.sort_values(by='Month_Num')
-            
-            # Calculate average excluding current month if it's the current year
-            current_year = datetime.now().year
-            current_month = datetime.now().month
-            if int(drill_state[0]) == current_year:
-                avg_count = df_grouped[df_grouped['Month_Num'] != current_month]['Redemption Count'].mean()
-            else:
-                avg_count = df_grouped['Redemption Count'].mean()
-            
-            # Add bar chart
-            fig.add_trace(go.Bar(
-                x=df_grouped['Month'],
-                y=df_grouped['Redemption Count'],
-                name='Redemption Count'
-            ))
-            
-            # Add average line
-            fig.add_trace(go.Scatter(
-                x=df_grouped['Month'],
-                y=[avg_count] * len(df_grouped),
-                mode='lines',
-                name=f'Average ({avg_count:,.0f})',
-                line=dict(color='red', dash='dash')
-            ))
-            
-            fig.update_layout(title=drill_titles[1].format(drill_state[0]))
-            
-        elif level == 2:
-            df_filtered = df[(df['Year'] == int(drill_state[0])) & (df['Month'] == drill_state[1])]
-            df_grouped = df_filtered.groupby("Day")['Redemption Count'].sum().reset_index()
-            # Sort by date
-            df_grouped = df_grouped.sort_values(by="Day")
-            # Convert date to string for display
-            df_grouped["Day_Str"] = df_grouped["Day"].astype(str)
-            
-            # Calculate average excluding current day if it's the current month and year
-            current_date = datetime.now().date()
-            current_year = datetime.now().year
-            current_month = datetime.now().month
-            if (int(drill_state[0]) == current_year and 
-                calendar.month_name[current_month] == drill_state[1]):
-                avg_count = df_grouped[df_grouped['Day'] != current_date]['Redemption Count'].mean()
-            else:
-                avg_count = df_grouped['Redemption Count'].mean()
-            
-            # Add bar chart
-            fig.add_trace(go.Bar(
-                x=df_grouped['Day_Str'],
-                y=df_grouped['Redemption Count'],
-                name='Redemption Count'
-            ))
-            
-            # Add average line
-            fig.add_trace(go.Scatter(
-                x=df_grouped['Day_Str'],
-                y=[avg_count] * len(df_grouped),
-                mode='lines',
-                name=f'Average ({avg_count:,.0f})',
-                line=dict(color='red', dash='dash')
-            ))
-            
-            fig.update_layout(title=drill_titles[2].format(drill_state[1], drill_state[0]))
-            
-        elif level == 3:
-            # Parse the date string from drill_state
-            selected_date = datetime.strptime(drill_state[2], "%Y-%m-%d").date()
-            df_filtered = df[df['Day'] == selected_date]
-            df_grouped = df_filtered.groupby("Hour")['Redemption Count'].sum().reset_index()
-            
-            # Calculate average excluding current hour if it's today
-            current_date = datetime.now().date()
-            current_hour = datetime.now().hour
-            if selected_date == current_date:
-                avg_count = df_grouped[df_grouped['Hour'] != current_hour]['Redemption Count'].mean()
-            else:
-                avg_count = df_grouped['Redemption Count'].mean()
-            
-            # Add bar chart
-            fig.add_trace(go.Bar(
-                x=df_grouped['Hour'],
-                y=df_grouped['Redemption Count'],
-                name='Redemption Count'
-            ))
-            
-            # Add average line
-            fig.add_trace(go.Scatter(
-                x=df_grouped['Hour'],
-                y=[avg_count] * len(df_grouped),
-                mode='lines',
-                name=f'Average ({avg_count:,.0f})',
-                line=dict(color='red', dash='dash')
-            ))
-            
-            fig.update_layout(title=drill_titles[3].format(drill_state[2]))
-            
-        elif level == 4:
-            # Parse the date string from drill_state
-            selected_date = datetime.strptime(drill_state[2], "%Y-%m-%d").date()
-            df_filtered = df[
-                (df['Day'] == selected_date) &
-                (df['Hour'] == int(drill_state[3]))
-            ]
-            df_grouped = df_filtered.groupby("Timestamp")['Redemption Count'].sum().reset_index()
-            df_grouped["label"] = df_grouped["Timestamp"].dt.strftime('%H:%M')
-            
-            # Calculate average excluding current 15-minute period if it's today and current hour
-            current_date = datetime.now().date()
-            current_hour = datetime.now().hour
-            if selected_date == current_date and int(drill_state[3]) == current_hour:
-                # Get current 15-minute period
-                current_minute = datetime.now().minute
-                current_period = current_minute // 15
-                current_period_start = current_period * 15
-                current_period_end = (current_period + 1) * 15
-                
-                # Filter out current period
-                df_avg = df_grouped[
-                    ~((df_grouped["Timestamp"].dt.hour == current_hour) & 
-                      (df_grouped["Timestamp"].dt.minute >= current_period_start) & 
-                      (df_grouped["Timestamp"].dt.minute < current_period_end))
-                ]
-                avg_count = df_avg['Redemption Count'].mean()
-            else:
-                avg_count = df_grouped['Redemption Count'].mean()
-            
-            # Add bar chart
-            fig.add_trace(go.Bar(
-                x=df_grouped['label'],
-                y=df_grouped['Redemption Count'],
-                name='Redemption Count'
-            ))
-            
-            # Add average line
-            fig.add_trace(go.Scatter(
-                x=df_grouped['label'],
-                y=[avg_count] * len(df_grouped),
-                mode='lines',
-                name=f'Average ({avg_count:,.0f})',
-                line=dict(color='red', dash='dash')
-            ))
-            
-            fig.update_layout(title=drill_titles[4].format(drill_state[2]))
-        else:
-            return dash.no_update, session_data
+        if df is None or df.empty:
+            raise ValueError("No data available")
         
-        fig.update_xaxes(type='category')
+        # Define consistent colors
+        colors = {
+            'bars': 'rgb(55, 83, 109)',  # Navy blue to match YTD graph
+            'line': 'red'                 # Red for the average line
+        }
+
+        fig = go.Figure()
+        
+        if drill_state == 0:  # Year level
+            grouped = df.groupby('Year')['Redemption Count'].sum().reset_index()
+            yearly_avg = grouped['Redemption Count'].mean()
+            
+            fig.add_trace(go.Bar(
+                x=grouped['Year'],
+                y=grouped['Redemption Count'],
+                name='Total Redemptions',
+                hovertemplate='Year: %{x}<br>Total: %{y:,.0f}<br>Click for monthly details<extra></extra>',
+                marker_color=colors['bars']
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=grouped['Year'],
+                y=[yearly_avg] * len(grouped),
+                mode='lines',
+                name='Yearly Average',
+                line=dict(color=colors['line'], dash='dot'),
+                hovertemplate='Yearly Avg: %{y:,.0f}<extra></extra>'
+            ))
+            
+            title = "Ferry Ticket Redemptions by Year<br><sup>Click on a year to see monthly details</sup>"
+        
+        elif drill_state == 1:  # Month level
+            year = int(selected_data[-1])
+            year_data = df[df['Year'] == year]
+            grouped = year_data.groupby('Month_Num')['Redemption Count'].sum().reset_index()
+            monthly_avg = grouped['Redemption Count'].mean()
+            
+            month_names = {i: calendar.month_abbr[i] for i in range(1, 13)}
+            grouped['Month'] = grouped['Month_Num'].map(month_names)
+            
+            fig.add_trace(go.Bar(
+                x=grouped['Month'],
+                y=grouped['Redemption Count'],
+                name='Total Redemptions',
+                hovertemplate='Month: %{x}<br>Total: %{y:,.0f}<br>Click for daily details<extra></extra>',
+                marker_color=colors['bars']
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=grouped['Month'],
+                y=[monthly_avg] * len(grouped),
+                mode='lines',
+                name='Monthly Average',
+                line=dict(color=colors['line'], dash='dot'),
+                hovertemplate='Monthly Avg: %{y:,.0f}<extra></extra>'
+            ))
+            
+            title = f"Monthly Redemptions for {year}<br><sup>Click on a month to see daily details</sup>"
+        
+        elif drill_state == 2:  # Day level
+            year = int(selected_data[-2])
+            month = list(calendar.month_abbr).index(selected_data[-1])
+            month_data = df[(df['Year'] == year) & (df['Month_Num'] == month)]
+            
+            grouped = month_data.groupby('Day')['Redemption Count'].sum().reset_index()
+            daily_avg = grouped['Redemption Count'].mean()
+            
+            fig.add_trace(go.Bar(
+                x=grouped['Day'],
+                y=grouped['Redemption Count'],
+                name='Total Redemptions',
+                hovertemplate='Date: %{x|%Y-%m-%d}<br>Total: %{y:,.0f}<br>Click for hourly details<extra></extra>',
+                marker_color=colors['bars']
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=grouped['Day'],
+                y=[daily_avg] * len(grouped),
+                mode='lines',
+                name='Daily Average',
+                line=dict(color=colors['line'], dash='dot'),
+                hovertemplate='Daily Avg: %{y:,.0f}<extra></extra>'
+            ))
+            
+            title = f"Daily Redemptions for {calendar.month_name[month]} {year}<br><sup>Click on a day to see hourly details</sup>"
+        
+        elif drill_state == 3:  # Hour level
+            selected_date = pd.to_datetime(selected_data[-1]).date()
+            day_data = df[df['Day'] == selected_date]
+            
+            grouped = day_data.groupby('Hour')['Redemption Count'].sum().reset_index()
+            hourly_avg = grouped['Redemption Count'].mean()
+            
+            fig.add_trace(go.Bar(
+                x=grouped['Hour'],
+                y=grouped['Redemption Count'],
+                name='Total Redemptions',
+                hovertemplate='Hour: %{x}:00<br>Total: %{y:,.0f}<br>Click for 15-min details<extra></extra>',
+                marker_color=colors['bars']
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=grouped['Hour'],
+                y=[hourly_avg] * len(grouped),
+                mode='lines',
+                name='Hourly Average',
+                line=dict(color=colors['line'], dash='dot'),
+                hovertemplate='Hourly Avg: %{y:,.0f}<extra></extra>'
+            ))
+            
+            title = f"Hourly Redemptions for {selected_date}<br><sup>Click on an hour to see 15-minute intervals</sup>"
+        
+        elif drill_state == 4:  # 15-minute level
+            selected_date = pd.to_datetime(selected_data[-2]).date()
+            selected_hour = int(selected_data[-1])
+            
+            # Filter data for the specific hour
+            hour_data = df[(df['Day'] == selected_date) & (df['Hour'] == selected_hour)]
+            
+            # Group by 15-minute intervals
+            hour_data['Minute_Group'] = (hour_data['Timestamp'].dt.minute // 15) * 15
+            grouped = hour_data.groupby('Minute_Group')['Redemption Count'].sum().reset_index()
+            interval_avg = grouped['Redemption Count'].mean()
+            
+            # Create labels for 15-minute intervals
+            grouped['Time_Label'] = grouped['Minute_Group'].apply(lambda x: f"{selected_hour:02d}:{x:02d}")
+            
+            fig.add_trace(go.Bar(
+                x=grouped['Time_Label'],
+                y=grouped['Redemption Count'],
+                name='Total Redemptions',
+                hovertemplate='Time: %{x}<br>Total: %{y:,.0f}<extra></extra>',
+                marker_color=colors['bars'],
+                text=grouped['Redemption Count'].apply(lambda x: f'{x:,.0f}'),
+                textposition='outside'
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=grouped['Time_Label'],
+                y=[interval_avg] * len(grouped),
+                mode='lines',
+                name='15-min Average',
+                line=dict(color=colors['line'], dash='dot'),
+                hovertemplate='15-min Avg: %{y:,.0f}<extra></extra>'
+            ))
+            
+            title = f"15-Minute Intervals for {selected_date} at {selected_hour:02d}:00"
+
+        # Update layout to match YTD/MTD graph
         fig.update_layout(
+            title=dict(
+                text=title,
+                x=0.5,
+                xanchor='center',
+                y=0.95,
+                yanchor='top',
+                font=dict(size=16)
+            ),
+            showlegend=True,
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
                 y=1.02,
                 xanchor="right",
                 x=1
+            ),
+            margin=dict(t=80, b=50, l=50, r=50),
+            hoverlabel=dict(
+                bgcolor="white",
+                font_size=14,
+                font_family="Arial"
+            ),
+            height=400,
+            paper_bgcolor='white',
+            plot_bgcolor='white',
+            xaxis=dict(
+                showgrid=False,
+                tickangle=45 if drill_state >= 2 else 0,  # Angle labels for better readability in day view and beyond
+                tickmode='array',
+                ticktext=grouped['Time_Label'] if drill_state == 4 else None,
+                tickvals=grouped['Time_Label'] if drill_state == 4 else None,
+                type='category'  # Force categorical axis
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridwidth=1,
+                gridcolor='LightGrey',
+                title='Redemption Count'
             )
         )
+        
+        # Add text labels to bars for all levels
+        if drill_state == 0:  # Year level
+            fig.update_traces(
+                text=grouped['Redemption Count'].apply(lambda x: f'{x:,.0f}'),
+                textposition='outside',
+                selector=dict(type='bar')
+            )
+        elif drill_state == 1:  # Month level
+            fig.update_traces(
+                text=grouped['Redemption Count'].apply(lambda x: f'{x:,.0f}'),
+                textposition='outside',
+                selector=dict(type='bar')
+            )
+        elif drill_state == 2:  # Day level
+            fig.update_traces(
+                text=grouped['Redemption Count'].apply(lambda x: f'{x:,.0f}'),
+                textposition='outside',
+                selector=dict(type='bar')
+            )
+        elif drill_state == 3:  # Hour level
+            fig.update_traces(
+                text=grouped['Redemption Count'].apply(lambda x: f'{x:,.0f}'),
+                textposition='outside',
+                selector=dict(type='bar')
+            )
+        
+        # Update session data
+        session_data = {
+            'drill_state': drill_state,
+            'selected_data': selected_data
+        }
+        
         return fig, session_data
+    
     except Exception as e:
-        print(f"Error updating graph: {e}")
-        return px.bar(title="Error loading data"), session_data
+        print(f"Error in update_bar_graph: {str(e)}")
+        return dash.no_update, dash.no_update
 
 # Update the YTD/MTD graph callback
 @app.callback(
@@ -750,15 +797,15 @@ def update_ytd_graph(clickData, n_clicks, n_intervals, session_data):
         session_data['drill_state'] = drill_state
         level = len(drill_state)
 
-        # Get current date info
-        current_date = datetime.now().date()
-        current_year = current_date.year
-        current_month = current_date.month
-        current_day = current_date.day
-
         # Create figure
         fig = go.Figure()
         
+        # Define colors to match the first graph
+        colors = {
+            'level0': 'rgb(55, 83, 109)',   # Navy blue for year level
+            'level1': 'rgb(26, 118, 255)'   # Light blue for month level
+        }
+
         if level == 0:
             # Get all years and filter for complete years only
             all_years = sorted(df['Year'].unique())
@@ -768,12 +815,12 @@ def update_ytd_graph(clickData, n_clicks, n_intervals, session_data):
             for year in complete_years:
                 year_data = df[df['Year'] == year]
                 
-                if year == current_year:
+                if year == datetime.now().year:
                     # For current year, only show up to current date
-                    ytd_count = year_data[year_data['Day'] <= current_date]['Redemption Count'].sum()
+                    ytd_count = year_data[year_data['Day'] <= datetime.now().date()]['Redemption Count'].sum()
                 else:
                     # For past years, show data up to the same month/day
-                    target_date = datetime(year, current_month, current_day).date()
+                    target_date = datetime(year, datetime.now().month, datetime.now().day).date()
                     ytd_count = year_data[year_data['Day'] <= target_date]['Redemption Count'].sum()
                 
                 ytd_data.append({'Year': year, 'Count': ytd_count})
@@ -786,21 +833,27 @@ def update_ytd_graph(clickData, n_clicks, n_intervals, session_data):
                 fig.add_trace(go.Bar(
                     x=plot_data['Year'],
                     y=plot_data['Count'],
-                    marker_color='rgb(55, 83, 109)',
+                    marker_color=colors['level0'],
                     text=plot_data['Count'].apply(lambda x: f'{x:,.0f}' if x > 0 else '0'),
-                    textposition='outside'
+                    textposition='outside',
+                    textfont=dict(size=12),
+                    cliponaxis=False
                 ))
+                
+                # Calculate y-axis range to accommodate labels
+                max_y = plot_data['Count'].max()
+                y_range = [0, max_y * 1.15]
                 
                 fig.update_layout(
                     title='Year-to-Date (YTD) Comparison',
                     showlegend=False,
-                    margin=dict(t=100),
+                    yaxis=dict(range=y_range),
                     xaxis=dict(
                         tickmode='array',
                         ticktext=[str(year) for year in plot_data['Year']],
                         tickvals=plot_data['Year'],
                         tickangle=0,
-                        type='category'
+                        showgrid=False
                     )
                 )
             else:
@@ -808,61 +861,100 @@ def update_ytd_graph(clickData, n_clicks, n_intervals, session_data):
 
         elif level == 1:
             selected_year = int(drill_state[0])
-            print(f"\nDEBUG - Processing monthly data for year {selected_year}")
             df_filtered = df[df['Year'] == selected_year]
             
             # Prepare monthly data
             monthly_data = []
             for month in range(1, 13):
-                if selected_year == current_year and month > current_month:
+                if selected_year == datetime.now().year and month > datetime.now().month:
                     continue
                 
                 month_data = df_filtered[df_filtered['Month_Num'] == month]
                 if not month_data.empty:
-                    if selected_year == current_year and month == current_month:
-                        end_date = current_date
+                    if selected_year == datetime.now().year and month == datetime.now().month:
+                        end_date = datetime.now().date()
                     else:
-                        end_date = datetime(selected_year, month, current_day).date()
+                        end_date = datetime(selected_year, month, datetime.now().day).date()
                     
                     mtd_count = month_data[month_data['Day'] <= end_date]['Redemption Count'].sum()
                     month_name = calendar.month_name[month]
-                    print(f"DEBUG - {month_name} {selected_year} count: {mtd_count}")
                     monthly_data.append({'Month': month_name, 'Count': mtd_count})
             
             plot_data = pd.DataFrame(monthly_data)
-            print(f"DEBUG - Monthly plot data:\n{plot_data}")
             
             if not plot_data.empty:
+                # Add bars for monthly data with text labels
                 fig.add_trace(go.Bar(
                     x=plot_data['Month'],
                     y=plot_data['Count'],
-                    marker_color='rgb(26, 118, 255)',
+                    marker_color=colors['level1'],
                     text=plot_data['Count'].apply(lambda x: f'{x:,.0f}'),
-                    textposition='outside'
+                    textposition='outside',
+                    textfont=dict(size=12),
+                    cliponaxis=False
                 ))
+                
+                # Calculate y-axis range to accommodate labels
+                max_y = plot_data['Count'].max()
+                y_range = [0, max_y * 1.15]
                 
                 fig.update_layout(
                     title=f'Monthly Analysis for {selected_year}',
                     showlegend=False,
-                    margin=dict(t=100),
+                    yaxis=dict(range=y_range),
                     xaxis=dict(
                         tickmode='array',
                         ticktext=plot_data['Month'],
                         tickvals=plot_data['Month'],
-                        tickangle=0
+                        tickangle=0,
+                        showgrid=False
                     )
                 )
             else:
-                print(f"DEBUG - No monthly data available for {selected_year}")
                 fig.update_layout(title=f'No data available for {selected_year}')
         
+        # Update layout
         fig.update_layout(
-            xaxis_title="",
-            yaxis_title="Redemption Count",
-            height=500
+            hoverlabel=dict(
+                bgcolor="white",
+                font_size=14,
+                font_family="Arial"
+            ),
+            margin=dict(t=80, b=50, l=50, r=50),
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.2,
+                xanchor="center",
+                x=0.5,
+                bgcolor="rgba(255, 255, 255, 0.9)"
+            ),
+            height=400,
+            title=dict(
+                y=0.95,
+                x=0.5,
+                xanchor='center',
+                yanchor='top'
+            ),
+            title_font=dict(
+                size=16
+            ),
+            paper_bgcolor='white',
+            plot_bgcolor='white',
+            xaxis=dict(
+                showgrid=False,
+                tickangle=0
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridwidth=1,
+                gridcolor='LightGrey',
+                title='Redemption Count'
+            )
         )
         
         return fig, session_data
+        
     except Exception as e:
         print(f"Error updating YTD graph: {e}")
         import traceback
