@@ -13,6 +13,8 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 import os
 import time
+import json
+import gc
 
 # Add development mode flag at the top of the file, after imports
 DEV_MODE = False  # Set to False in production
@@ -29,6 +31,10 @@ last_refresh = {
 # Constants
 HISTORICAL_DATA_FILE = 'historical_ferry_data.csv'
 DATA_BACKUP_FILE = 'data_backup.csv'
+
+# Constants for data management
+CACHE_TIMEOUT = 3600  # 1 hour in seconds
+CACHE_FILE = 'data_cache.json'
 
 def save_to_historical_data(df):
     """Save new data to historical dataset, avoiding duplicates"""
@@ -74,27 +80,71 @@ def save_to_historical_data(df):
         print(traceback.format_exc())
         return df
 
+def load_cached_data():
+    """Load data from cache file if it exists and is recent"""
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, 'r') as f:
+                cache_data = json.load(f)
+                cache_time = datetime.fromisoformat(cache_data['timestamp'])
+                if datetime.now() - cache_time < timedelta(seconds=CACHE_TIMEOUT):
+                    print("DEBUG - Using cached data")
+                    return cache_data['data']
+    except Exception as e:
+        print(f"DEBUG - Cache read error: {e}")
+    return None
+
+def save_to_cache(data):
+    """Save processed data to cache file"""
+    try:
+        cache_data = {
+            'timestamp': datetime.now().isoformat(),
+            'data': data
+        }
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(cache_data, f)
+        print("DEBUG - Data cached successfully")
+    except Exception as e:
+        print(f"DEBUG - Cache write error: {e}")
+
 @lru_cache(maxsize=1)
 def get_processed_data():
-    """Get processed data from both API and historical sources"""
+    """Get processed data with memory optimization"""
     try:
-        data = load_data()
+        # Try to load from cache first
+        cached_data = load_cached_data()
+        if cached_data is not None:
+            return pd.read_json(StringIO(cached_data), orient='split')
+
+        print("\nDEBUG - Cache miss, processing data")
         
-        # Read data in chunks to reduce memory usage
-        df = pd.read_json(StringIO(data['ferry_data']), orient='split')
-        
-        # Process only necessary columns
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        # If historical data exists, use it
+        if os.path.exists(HISTORICAL_DATA_FILE):
+            print("DEBUG - Loading from historical file")
+            # Read only necessary columns
+            df = pd.read_csv(HISTORICAL_DATA_FILE, 
+                           usecols=['Timestamp', 'Redemption Count'],
+                           parse_dates=['Timestamp'])
+        else:
+            # Fetch from API if needed
+            print("DEBUG - Fetching from API")
+            data = fetch_ferry_data()
+            df = pd.read_csv(StringIO(data), 
+                           usecols=['Timestamp', 'Redemption Count'],
+                           parse_dates=['Timestamp'])
+            
+        # Process data with minimal memory usage
         df['Day'] = df['Timestamp'].dt.date
         df['Year'] = df['Timestamp'].dt.year
         df['Month_Num'] = df['Timestamp'].dt.month
         df['Month'] = df['Month_Num'].apply(lambda x: calendar.month_name[x])
-        df['Day_Str'] = df['Day'].astype(str)
         df['Hour'] = df['Timestamp'].dt.hour
         
-        # Keep only necessary columns
-        columns_to_keep = ['Timestamp', 'Day', 'Year', 'Month_Num', 'Month', 'Day_Str', 'Hour', 'Redemption Count']
-        df = df[columns_to_keep]
+        # Force garbage collection
+        gc.collect()
+        
+        # Cache the processed data
+        save_to_cache(df.to_json(date_format='iso', orient='split'))
         
         return df
     except Exception as e:
