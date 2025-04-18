@@ -87,9 +87,12 @@ def load_cached_data():
             with open(CACHE_FILE, 'r') as f:
                 cache_data = json.load(f)
                 cache_time = datetime.fromisoformat(cache_data['timestamp'])
-                if datetime.now() - cache_time < timedelta(seconds=CACHE_TIMEOUT):
+                # Only use cache if it's less than 15 minutes old
+                if datetime.now() - cache_time < timedelta(minutes=15):
                     print("DEBUG - Using cached data")
                     return cache_data['data']
+                else:
+                    print("DEBUG - Cache expired, fetching new data")
     except Exception as e:
         print(f"DEBUG - Cache read error: {e}")
     return None
@@ -114,25 +117,20 @@ def get_processed_data():
         # Try to load from cache first
         cached_data = load_cached_data()
         if cached_data is not None:
-            return pd.read_json(StringIO(cached_data), orient='split')
+            df = pd.read_json(StringIO(cached_data), orient='split')
+            # Ensure Day column is datetime.date
+            df['Day'] = pd.to_datetime(df['Day']).dt.date
+            return df
 
         print("\nDEBUG - Cache miss, processing data")
         
-        # If historical data exists, use it
-        if os.path.exists(HISTORICAL_DATA_FILE):
-            print("DEBUG - Loading from historical file")
-            # Read only necessary columns
-            df = pd.read_csv(HISTORICAL_DATA_FILE, 
-                           usecols=['Timestamp', 'Redemption Count'],
-                           parse_dates=['Timestamp'])
-        else:
-            # Fetch from API if needed
-            print("DEBUG - Fetching from API")
-            data = fetch_ferry_data()
-            df = pd.read_csv(StringIO(data), 
-                           usecols=['Timestamp', 'Redemption Count'],
-                           parse_dates=['Timestamp'])
-            
+        # Always fetch fresh data from API
+        print("DEBUG - Fetching from API")
+        data = fetch_ferry_data()
+        df = pd.read_csv(StringIO(data), 
+                       usecols=['Timestamp', 'Redemption Count'],
+                       parse_dates=['Timestamp'])
+        
         # Process data with minimal memory usage
         df['Day'] = df['Timestamp'].dt.date
         df['Year'] = df['Timestamp'].dt.year
@@ -512,7 +510,7 @@ def update_visitor_stats(n):
         else:
             mtd_last_year = 0
         
-        # Calculate DTD counts
+        # Calculate DTD counts - Modified to handle current day better
         dtd_current = df[
             (df['Year'] == current_year) & 
             (df['Month_Num'] == current_month) &
