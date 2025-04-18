@@ -1,8 +1,8 @@
-   workers = 2
+   workers = 1
    worker_class = 'gthread'
-   threads = 4
-   worker_connections = 1000
-   timeout = 120
+   threads = 2
+   worker_connections = 500
+   timeout = 180
    keepalive = 5
-   max_requests = 1000
-   max_requests_jitter = 50
+   max_requests = 100
+   max_requests_jitter = 20

@@ -317,7 +317,7 @@ app.layout = dbc.Container([
     # Store components
     dcc.Store(id='session-data', data={'drill_state': []}),
     dcc.Store(id='ytd-session-data', data={'drill_state': []}),
-    dcc.Interval(id='interval-component', interval=3600000, n_intervals=0),
+    dcc.Interval(id='interval-component', interval=900000, n_intervals=0),  # 15 minutes in milliseconds
     
     # Main content
     dbc.Row([
@@ -454,13 +454,23 @@ app.layout = dbc.Container([
     Input('interval-component', 'n_intervals')
 )
 def update_last_updated(n):
-    if last_refresh['timestamp']:
-        # Clear the cache if data needs refresh
+    try:
+        # Force a data refresh check
         current_time = datetime.now()
-        if current_time - last_refresh['timestamp'] >= timedelta(hours=1):
-            get_processed_data.cache_clear()
-        return f"Data last updated: {last_refresh['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}"
-    return "Data last updated: Never"
+        
+        if last_refresh['timestamp']:
+            # Check if cache needs to be cleared (15 minutes)
+            if current_time - last_refresh['timestamp'] >= timedelta(minutes=15):
+                print("DEBUG - Cache expired, clearing cache")
+                get_processed_data.cache_clear()
+                # Force a new data fetch
+                df = get_processed_data()
+                return f"Data last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            return f"Data last updated: {last_refresh['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}"
+        return "Data last updated: Never"
+    except Exception as e:
+        print(f"Error updating timestamp: {e}")
+        return "Data last updated: Error checking update time"
 
 # Callback to update visitor statistics
 @app.callback(
