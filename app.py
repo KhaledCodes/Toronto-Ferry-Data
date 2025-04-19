@@ -114,12 +114,16 @@ def save_to_cache(data):
 def get_processed_data():
     """Get processed data with memory optimization"""
     try:
+        global last_refresh  # Add this line to access global variable
+        
         # Try to load from cache first
         cached_data = load_cached_data()
         if cached_data is not None:
             df = pd.read_json(StringIO(cached_data), orient='split')
             # Ensure Day column is datetime.date
             df['Day'] = pd.to_datetime(df['Day']).dt.date
+            # Update timestamp even when using cache
+            last_refresh['timestamp'] = datetime.now()
             return df
 
         print("\nDEBUG - Cache miss, processing data")
@@ -137,6 +141,10 @@ def get_processed_data():
         df['Month_Num'] = df['Timestamp'].dt.month
         df['Month'] = df['Month_Num'].apply(lambda x: calendar.month_name[x])
         df['Hour'] = df['Timestamp'].dt.hour
+        
+        # Update last_refresh timestamp and data
+        last_refresh['timestamp'] = datetime.now()
+        last_refresh['ferry_data'] = data
         
         # Force garbage collection
         gc.collect()
@@ -308,8 +316,30 @@ drill_titles = [
 
 # Layout
 app.layout = dbc.Container([
-    # Navigation bar
-    dbc.NavbarSimple(brand="Toronto Ferry Dashboard", color="primary", dark=True, className="mb-2"),
+    # Navigation bar with attribution
+    dbc.NavbarSimple(
+        brand="Toronto Ferry Dashboard (Live)",
+        color="primary",
+        dark=True,
+        className="mb-2",
+        children=[
+            html.A(
+                "Created by Khaled Khatib",
+                href="https://www.linkedin.com/in/khaled-khatib/",
+                target="_blank",
+                className="text-white",
+                style={
+                    "textDecoration": "underline",
+                    "transition": "opacity 0.2s",
+                    "opacity": "0.9",
+                    "&:hover": {
+                        "opacity": "1",
+                        "textDecoration": "underline"
+                    }
+                }
+            )
+        ]
+    ),
     
     # Last updated text below navbar
     html.Div(id="last-updated", className="text-muted small mb-4"),
@@ -448,6 +478,28 @@ app.layout = dbc.Container([
     ], className="g-4")  # Added g-4 for gap between columns
 ], fluid=True, className="px-4 py-3")
 
+# Footer with attribution
+html.Div([
+    html.Hr(className="my-4"),
+    html.Div([
+        html.A(
+            "Created by Khaled Khatib",
+            href="https://www.linkedin.com/in/khaled-khatib/",
+            target="_blank",
+            className="text-primary",
+            style={
+                "textDecoration": "underline",
+                "transition": "opacity 0.2s",
+                "opacity": "0.9",
+                "&:hover": {
+                    "opacity": "1",
+                    "textDecoration": "underline"
+                }
+            }
+        )
+    ], className="text-center")
+], className="mt-4")
+
 # Callback to check for data updates
 @app.callback(
     Output('last-updated', 'children'),
@@ -458,19 +510,24 @@ def update_last_updated(n):
         # Force a data refresh check
         current_time = datetime.now()
         
+        # Always try to get processed data to ensure timestamp is set
+        df = get_processed_data()
+        
         if last_refresh['timestamp']:
             # Check if cache needs to be cleared (15 minutes)
             if current_time - last_refresh['timestamp'] >= timedelta(minutes=15):
-                print("DEBUG - Cache expired, clearing cache")
+                print("DEBUG - Cache expired, checking for new data")
                 get_processed_data.cache_clear()
                 # Force a new data fetch
                 df = get_processed_data()
-                return f"Data last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            
             return f"Data last updated: {last_refresh['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}"
-        return "Data last updated: Never"
+        else:
+            # This should rarely happen now
+            return "Error: Could not determine last update time"
     except Exception as e:
         print(f"Error updating timestamp: {e}")
-        return "Data last updated: Error checking update time"
+        return f"Error checking update time: {str(e)}"
 
 # Callback to update visitor statistics
 @app.callback(
