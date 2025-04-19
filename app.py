@@ -15,9 +15,13 @@ import os
 import time
 import json
 import gc
+import pytz  # Add pytz for timezone handling
 
 # Add development mode flag at the top of the file, after imports
 DEV_MODE = False  # Set to False in production
+
+# Set timezone to Toronto
+TORONTO_TZ = pytz.timezone('America/Toronto')
 
 # Global variable to store the last refresh time and data
 # This is okay to be global as it's read-only for users
@@ -86,9 +90,9 @@ def load_cached_data():
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE, 'r') as f:
                 cache_data = json.load(f)
-                cache_time = datetime.fromisoformat(cache_data['timestamp'])
+                cache_time = datetime.fromisoformat(cache_data['timestamp']).replace(tzinfo=TORONTO_TZ)
                 # Only use cache if it's less than 15 minutes old
-                if datetime.now() - cache_time < timedelta(minutes=15):
+                if get_current_toronto_time() - cache_time < timedelta(minutes=15):
                     print("DEBUG - Using cached data")
                     return cache_data['data']
                 else:
@@ -101,7 +105,7 @@ def save_to_cache(data):
     """Save processed data to cache file"""
     try:
         cache_data = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': get_current_toronto_time().isoformat(),
             'data': data
         }
         with open(CACHE_FILE, 'w') as f:
@@ -114,7 +118,7 @@ def save_to_cache(data):
 def get_processed_data():
     """Get processed data with memory optimization"""
     try:
-        global last_refresh  # Add this line to access global variable
+        global last_refresh
         
         # Try to load from cache first
         cached_data = load_cached_data()
@@ -123,7 +127,7 @@ def get_processed_data():
             # Ensure Day column is datetime.date
             df['Day'] = pd.to_datetime(df['Day']).dt.date
             # Update timestamp even when using cache
-            last_refresh['timestamp'] = datetime.now()
+            last_refresh['timestamp'] = get_current_toronto_time()
             return df
 
         print("\nDEBUG - Cache miss, processing data")
@@ -143,7 +147,7 @@ def get_processed_data():
         df['Hour'] = df['Timestamp'].dt.hour
         
         # Update last_refresh timestamp and data
-        last_refresh['timestamp'] = datetime.now()
+        last_refresh['timestamp'] = get_current_toronto_time()
         last_refresh['ferry_data'] = data
         
         # Force garbage collection
@@ -508,7 +512,7 @@ html.Div([
 def update_last_updated(n):
     try:
         # Force a data refresh check
-        current_time = datetime.now()
+        current_time = get_current_toronto_time()
         
         # Always try to get processed data to ensure timestamp is set
         df = get_processed_data()
@@ -521,7 +525,7 @@ def update_last_updated(n):
                 # Force a new data fetch
                 df = get_processed_data()
             
-            return f"Data last updated: {last_refresh['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}"
+            return f"Data last updated: {last_refresh['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} (Toronto Time)"
         else:
             # This should rarely happen now
             return "Error: Could not determine last update time"
@@ -543,8 +547,8 @@ def update_visitor_stats(n):
     try:
         df = get_processed_data()
         
-        # Get current date info
-        current_date = datetime.now().date()
+        # Get current date info in Toronto timezone
+        current_date = get_current_toronto_date()
         current_year = current_date.year
         current_month = current_date.month
         current_day = current_date.day
@@ -557,7 +561,7 @@ def update_visitor_stats(n):
         
         ytd_last_year = df[
             (df['Year'] == current_year - 1) & 
-            (df['Day'] <= datetime(current_year - 1, current_month, current_day).date())
+            (df['Day'] <= datetime(current_year - 1, current_month, current_day, tzinfo=TORONTO_TZ).date())
         ]['Redemption Count'].sum()
         
         # Calculate MTD counts
@@ -572,12 +576,12 @@ def update_visitor_stats(n):
         if not last_year_data.empty and current_month <= last_year_data['Month_Num'].max():
             mtd_last_year = last_year_data[
                 (last_year_data['Month_Num'] == current_month) &
-                (last_year_data['Day'] <= datetime(current_year - 1, current_month, current_day).date())
+                (last_year_data['Day'] <= datetime(current_year - 1, current_month, current_day, tzinfo=TORONTO_TZ).date())
             ]['Redemption Count'].sum()
         else:
             mtd_last_year = 0
         
-        # Calculate DTD counts - Modified to handle current day better
+        # Calculate DTD counts
         dtd_current = df[
             (df['Year'] == current_year) & 
             (df['Month_Num'] == current_month) &
@@ -585,7 +589,7 @@ def update_visitor_stats(n):
         ]['Redemption Count'].sum()
         
         # For last year's DTD, handle the case where the date exists in last year's data
-        last_year_same_day = datetime(current_year - 1, current_month, current_day).date()
+        last_year_same_day = datetime(current_year - 1, current_month, current_day, tzinfo=TORONTO_TZ).date()
         dtd_last_year = df[
             (df['Year'] == current_year - 1) & 
             (df['Day'] == last_year_same_day)
@@ -1075,6 +1079,14 @@ def update_ytd_graph(clickData, n_clicks, n_intervals, session_data):
         import traceback
         print(traceback.format_exc())
         return px.bar(title="Error loading data"), session_data
+
+def get_current_toronto_time():
+    """Get current time in Toronto timezone"""
+    return datetime.now(TORONTO_TZ)
+
+def get_current_toronto_date():
+    """Get current date in Toronto timezone"""
+    return get_current_toronto_time().date()
 
 if __name__ == '__main__':
     # For local development
