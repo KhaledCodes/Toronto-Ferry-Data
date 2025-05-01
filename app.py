@@ -443,7 +443,7 @@ app.layout = dbc.Container([
             dbc.Row([
                 dbc.Col([
                     dbc.Card([
-                        dbc.CardHeader("Last Month (MTD)"),
+                        dbc.CardHeader("This Month Last Year (MTD)"),
                         dbc.CardBody([
                             html.H3(id="month-count", className="text-center mb-0")
                         ])
